@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local scratch / rendered output
+/tmp/
+*.local.md
+*.local.yaml
+site/
+_site/
+*.pdf
+
+# Rendered manifests / secrets
+rendered/
+*.key
+*.crt
+*.pem
+
+# Credentials
+*.env
+credentials.json

@@ -1,0 +1,202 @@
+---
+# PrometheusRule for a MinIO tenant. Metric names follow the MinIO v2 cluster metrics
+# endpoint (/minio/v2/metrics/cluster). Verify against your release before deploying —
+# MinIO has renamed metrics across major versions.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: minio-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: minio.availability
+      interval: 30s
+      rules:
+        - alert: MinIODown
+          expr: up{job=~".*minio.*"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MinIO endpoint {{ $labels.instance }} is not scrapeable"
+            description: >-
+              Prometheus cannot reach the MinIO metrics endpoint on
+              {{ $labels.instance }}. Either the server is down or the metrics path
+              changed. Check `mc admin info` and the tenant pods.
+            runbook: "docs/erasure-coding.md#healing"
+
+        - alert: MinIODriveOffline
+          expr: minio_cluster_drive_offline_total > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} MinIO drive(s) offline"
+            description: >-
+              Offline drives reduce the failure budget of their erasure set. At EC:4 on
+              16 drives, four offline drives means the next failure makes the set
+              read-only. Replace the drive (present an empty XFS filesystem at the same
+              mount path) and let MinIO heal into it.
+
+        - alert: MinIOEraseSetAtRiskOfReadOnly
+          # More offline drives than parity minus one: the next failure loses writes.
+          # Adjust the literal 4 to the tenant's configured parity.
+          expr: minio_cluster_drive_offline_total >= 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MinIO is one drive failure away from losing write quorum"
+            description: >-
+              Write quorum is k+1. With parity 4 on a 16-drive set, five offline drives
+              makes the tenant read-only — every backup job that writes here will fail
+              while restores continue to work. Treat as an urgent capacity event.
+
+        - alert: MinIONodeOffline
+          expr: minio_cluster_nodes_offline_total > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $value }} MinIO node(s) offline"
+            description: >-
+              A node carries volumesPerServer drives from the same erasure set. One node
+              down typically consumes the entire parity budget. Do not restart another
+              node until this one is back.
+
+        - alert: MinIOHealingInProgress
+          expr: minio_heal_objects_heal_total > 0
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "MinIO healing has been running for over 30 minutes"
+            description: >-
+              Informational. Healing consumes IO and free space; expect elevated latency
+              and reduced write headroom until it completes. `mc admin heal --recursive`
+              shows progress.
+
+    - name: minio.capacity
+      interval: 60s
+      rules:
+        - alert: MinIOCapacityHigh
+          expr: >-
+            (
+              1 - (
+                minio_cluster_capacity_usable_free_bytes
+                / minio_cluster_capacity_usable_total_bytes
+              )
+            ) > 0.75
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MinIO usable capacity above 75% ({{ $value | humanizePercentage }})"
+            description: >-
+              Object storage should not be planned past 80% — healing needs free space to
+              write reconstructed shards, and versioned deletes increase usage before
+              lifecycle rules reclaim it. Review ILM rules and plan a pool addition now,
+              not at 90%.
+
+        - alert: MinIOCapacityCritical
+          expr: >-
+            (
+              1 - (
+                minio_cluster_capacity_usable_free_bytes
+                / minio_cluster_capacity_usable_total_bytes
+              )
+            ) > 0.85
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MinIO usable capacity above 85% ({{ $value | humanizePercentage }})"
+            description: >-
+              At this level healing may be unable to complete and writes will start
+              failing soon. Every dependent backup job fails with them. Expire old
+              versions immediately or add a pool.
+
+        - alert: MinIOCapacityWillFillIn7Days
+          expr: >-
+            predict_linear(minio_cluster_capacity_usable_free_bytes[24h], 7 * 86400) < 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "MinIO projected to run out of space within 7 days"
+            description: >-
+              Linear projection over the last 24h of free space. Lead time on adding a
+              pool (hardware, PVCs, rebalance) is usually longer than a week — start now.
+
+    - name: minio.errors
+      interval: 30s
+      rules:
+        - alert: MinIOS3ErrorRateHigh
+          expr: >-
+            sum(rate(minio_s3_requests_errors_total[5m]))
+              / clamp_min(sum(rate(minio_s3_requests_total[5m])), 1)
+            > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MinIO S3 error rate above 5%"
+            description: >-
+              Check whether the errors are 4xx (client/policy problems — a service account
+              lost a permission, a bucket was renamed) or 5xx (server-side). The two have
+              completely different responses.
+
+        - alert: MinIOS3ServerErrors
+          expr: sum(rate(minio_s3_requests_5xx_errors_total[5m])) > 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MinIO returning 5xx errors"
+            description: >-
+              Server-side failures. Check drive health, quorum, and the tenant logs.
+
+        - alert: MinIOS3RequestLatencyHigh
+          expr: >-
+            histogram_quantile(
+              0.99,
+              sum(rate(minio_s3_requests_ttfb_seconds_distribution_bucket[5m])) by (le, api)
+            ) > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MinIO p99 TTFB above 5s for {{ $labels.api }}"
+            description: >-
+              Sustained high latency. Common causes: healing in progress, a degraded
+              drive that has not yet been marked offline, network saturation, or CPU
+              throttling from a limit that should not be set.
+
+    - name: minio.replication
+      interval: 60s
+      rules:
+        - alert: MinIOReplicationBacklogGrowing
+          expr: minio_bucket_replication_latency_ms > 300000
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Bucket replication lag over 5 minutes on {{ $labels.bucket }}"
+            description: >-
+              Site or bucket replication is falling behind. If this bucket is the offsite
+              copy of a backup, the recovery point is drifting — treat it as an RPO
+              breach, not just a queue.
+
+        - alert: MinIOReplicationFailing
+          expr: rate(minio_bucket_replication_failed_count[15m]) > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Replication failures on bucket {{ $labels.bucket }}"
+            description: >-
+              Objects are failing to replicate to the target site. Check target
+              reachability and the replication service account's permissions on the
+              remote — an expired or narrowed policy is the usual cause.

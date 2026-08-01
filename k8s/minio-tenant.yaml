@@ -1,0 +1,255 @@
+---
+# Namespace for the tenant. One namespace per tenant keeps RBAC, quotas and network
+# policy boundaries clean.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minio-tenant
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+# Root credentials. In practice these come from an external secret manager
+# (External Secrets Operator, Vault Agent, SOPS) — never from a committed manifest.
+# The root account is used to bootstrap policies and service accounts and then should
+# not appear in any application configuration.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-tenant-env
+  namespace: minio-tenant
+type: Opaque
+stringData:
+  config.env: |-
+    export MINIO_ROOT_USER="REPLACE_FROM_SECRET_MANAGER"
+    export MINIO_ROOT_PASSWORD="REPLACE_FROM_SECRET_MANAGER"
+    # Parity for the STANDARD storage class. Fixed for the life of the tenant's data —
+    # see docs/erasure-coding.md before changing.
+    export MINIO_STORAGE_CLASS_STANDARD="EC:4"
+    # Browser console off for a tenant that only serves machine clients.
+    export MINIO_BROWSER="off"
+    # Prometheus metrics without a bearer token, so the ServiceMonitor stays simple.
+    # Only acceptable when the metrics port is not reachable from outside the cluster.
+    export MINIO_PROMETHEUS_AUTH_TYPE="public"
+---
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: storage
+  namespace: minio-tenant
+  labels:
+    app: minio
+  annotations:
+    prometheus.io/path: /minio/v2/metrics/cluster
+    prometheus.io/port: "9000"
+    prometheus.io/scrape: "true"
+spec:
+  image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+  imagePullPolicy: IfNotPresent
+
+  # References the Secret above rather than inline credentials.
+  configuration:
+    name: minio-tenant-env
+
+  # Root credentials are not usable by applications; every workload gets its own
+  # service account with a scoped policy. See docs/access-policies.md.
+  requestAutoCert: true
+
+  pools:
+    # 4 servers x 4 drives = 16 drives = one erasure set of 16.
+    # With EC:4 this survives 4 drive failures, i.e. exactly one whole server.
+    # There is no margin beyond that: size parity against the node failure domain.
+    - name: pool-0
+      servers: 4
+      volumesPerServer: 4
+      volumeClaimTemplate:
+        metadata:
+          name: data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # Local NVMe is the right substrate. Network block storage works but pays for
+          # redundancy twice — see docs/erasure-coding.md.
+          storageClassName: local-nvme
+          resources:
+            requests:
+              storage: 2Ti
+
+      resources:
+        requests:
+          cpu: "4"
+          memory: 16Gi
+        limits:
+          # No CPU limit: MinIO is throughput-oriented and CPU throttling shows up as
+          # unexplained latency. Memory limit equals the request to keep it Guaranteed.
+          memory: 16Gi
+
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+      containerSecurityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+
+      # One MinIO server per node. Two servers on one node means a node loss costs
+      # 8 of 16 drives, which no reasonable parity level survives.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: v1.min.io/tenant
+                    operator: In
+                    values: ["storage"]
+              topologyKey: kubernetes.io/hostname
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              v1.min.io/tenant: storage
+
+      nodeSelector:
+        node-role.kubernetes.io/storage: "true"
+
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: storage
+          effect: NoSchedule
+
+  # Buckets created at tenant bootstrap. Idempotent — existing buckets are left alone.
+  buckets:
+    - name: velero
+      objectLock: true
+    - name: pgbackrest
+      objectLock: true
+    - name: artifacts
+      objectLock: false
+
+  # Prometheus scrape target for the operator-managed metrics endpoint.
+  prometheusOperator: false
+
+  # Keep server logs going to stdout for the cluster log pipeline.
+  logging:
+    anonymous: false
+    json: true
+    quiet: false
+
+  # Rolling updates one server at a time; MinIO tolerates it within parity, but a
+  # simultaneous restart of two servers on a 16-drive EC:4 set is an outage.
+  podManagementPolicy: Parallel
+
+  exposeServices:
+    console: false
+    minio: false
+
+  # Scheduled per-tenant maintenance: the operator triggers a bucket-level scan.
+  features:
+    bucketDNS: false
+    enableSFTP: false
+---
+# ClusterIP service for in-cluster S3 clients. Deliberately not exposed externally;
+# anything outside the cluster goes through an ingress with its own TLS and auth review.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-s3
+  namespace: minio-tenant
+  labels:
+    app: minio
+spec:
+  type: ClusterIP
+  selector:
+    v1.min.io/tenant: storage
+  ports:
+    - name: https-minio
+      port: 443
+      targetPort: 9000
+      protocol: TCP
+---
+# Default-deny egress/ingress for the tenant, with explicit allowances. Object storage
+# holding backups is a high-value target; it should not be reachable from every namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minio-tenant-access
+  namespace: minio-tenant
+spec:
+  podSelector:
+    matchLabels:
+      v1.min.io/tenant: storage
+  policyTypes:
+    - Ingress
+  ingress:
+    # Inter-node traffic within the tenant — required for erasure coding.
+    - from:
+        - podSelector:
+            matchLabels:
+              v1.min.io/tenant: storage
+      ports:
+        - port: 9000
+          protocol: TCP
+    # Explicit consumers only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: velero
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: databases
+      ports:
+        - port: 9000
+          protocol: TCP
+    # Prometheus scraping.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9000
+          protocol: TCP
+---
+# The tenant must not be drained below write quorum by voluntary disruptions.
+# With 4 servers and EC:4, losing two at once takes writes down.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: minio-storage
+  namespace: minio-tenant
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      v1.min.io/tenant: storage
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: minio-storage
+  namespace: minio-tenant
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: minio
+  endpoints:
+    - port: https-minio
+      scheme: https
+      path: /minio/v2/metrics/cluster
+      interval: 30s
+      tlsConfig:
+        # requestAutoCert issues certs from the operator's own CA; skip verification
+        # here or mount the CA bundle into Prometheus.
+        insecureSkipVerify: true
